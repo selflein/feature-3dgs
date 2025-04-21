@@ -38,6 +38,7 @@ class CameraInfo(NamedTuple):
     semantic_feature: torch.tensor 
     semantic_feature_path: str 
     semantic_feature_name: str 
+    mask: np.array = None
 
 
 class SceneInfo(NamedTuple):
@@ -73,6 +74,8 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, semantic_feature_folder):
     cam_infos = []
+
+    mask_folder = Path(images_folder).parent /  "masks"
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -101,12 +104,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, semantic_fe
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
+        mask_path = mask_folder / os.path.basename(extr.name)
+        if mask_path.exists():
+            mask = Image.open(mask_path)
+        else:
+            mask = None
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path) 
 
-        
         semantic_feature_path = os.path.join(semantic_feature_folder, image_name) + '_fmap_CxHxW.pt' 
         semantic_feature_name = os.path.basename(semantic_feature_path).split(".")[0]
         semantic_feature = torch.load(semantic_feature_path) 
@@ -115,7 +122,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, semantic_fe
                               image_path=image_path, image_name=image_name, width=width, height=height,
                               semantic_feature=semantic_feature,
                               semantic_feature_path=semantic_feature_path,
-                              semantic_feature_name=semantic_feature_name) 
+                              semantic_feature_name=semantic_feature_name,
+                              mask=mask) 
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

@@ -59,6 +59,18 @@ class GaussianModel:
         self.setup_functions()
         self._semantic_feature = torch.empty(0) 
 
+    def set_gaussian_opt_enabled(self, enable: bool = False):
+        for feat in (
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            # self._semantic_feature,
+        ):
+            feat.requires_grad = enable
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -246,9 +258,12 @@ class GaussianModel:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        count = sum(1 for name in plydata.elements[0].data.dtype.names if name.startswith("semantic_"))
-        semantic_feature = np.stack([np.asarray(plydata.elements[0][f"semantic_{i}"]) for i in range(count)], axis=1) 
-        semantic_feature = np.expand_dims(semantic_feature, axis=-1) 
+        try:
+            count = sum(1 for name in plydata.elements[0].data.dtype.names if name.startswith("semantic_"))
+            semantic_feature = np.stack([np.asarray(plydata.elements[0][f"semantic_{i}"]) for i in range(count)], axis=1) 
+            semantic_feature = np.expand_dims(semantic_feature, axis=-1) 
+        except ValueError:
+            semantic_feature = np.zeros((xyz.shape[0], 256, 1))
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
