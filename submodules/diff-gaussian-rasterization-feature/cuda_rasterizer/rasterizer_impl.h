@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <stdint.h>
 #include <iostream>
 #include <vector>
 #include "rasterizer.h"

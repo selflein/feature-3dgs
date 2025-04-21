@@ -11,3 +11,4 @@ screenshots
 *.pth
 data
 data_scannet
+.egg-info
