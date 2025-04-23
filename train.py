@@ -16,6 +16,7 @@ from utils.loss_utils import l1_loss, ssim, tv_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from sklearn.decomposition import PCA
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -31,14 +32,17 @@ except ImportError:
 
 import torch.nn.functional as F
 from models.networks import CNN_decoder
-from models.semantic_dataloader import VariableSizeDataset
-from torch.utils.data import DataLoader
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, only_add_features=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, load_iteration=-1 if only_add_features else None)
+    if only_add_features:
+        first_iter = scene.loaded_iter
+        print(f"Only adding features to existing 3DGS model from iteration {first_iter}")
+        gaussians.set_gaussian_opt_enabled(False)
 
     # 2D semantic feature map CNN decoder
     viewpoint_stack = scene.getTrainCameras().copy()
@@ -53,9 +57,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         cnn_decoder = CNN_decoder(feature_in_dim, feature_out_dim)
         cnn_decoder_optimizer = torch.optim.Adam(cnn_decoder.parameters(), lr=0.0001)
 
-
     gaussians.training_setup(opt)
-    if checkpoint:
+    if checkpoint and not only_add_features:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
@@ -100,7 +103,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ignore_mask = mask[0] == 0
         image[:, ignore_mask] = gt_image[:, ignore_mask]
 
-        Ll1 = l1_loss(image, gt_image, mask=mask)
+        Ll1 = l1_loss(image, gt_image)
 
         gt_feature_map = viewpoint_cam.semantic_feature.cuda(non_blocking=True)
         feature_map = F.interpolate(feature_map.unsqueeze(0), size=(gt_feature_map.shape[1], gt_feature_map.shape[2]), mode='bilinear', align_corners=True).squeeze(0) 
@@ -173,31 +176,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        with torch.no_grad():        
-            if network_gui.conn == None:
-                network_gui.try_connect(dataset.render_items)
-            while network_gui.conn != None:
-                try:
-                    net_image_bytes = None
-                    custom_cam, do_training, keep_alive, scaling_modifer, render_mode = network_gui.receive()
-                    if custom_cam != None:
-                        render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer)   
-                        net_image = render_net_image(render_pkg, dataset.render_items, render_mode, custom_cam)
-                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                    metrics_dict = {
-                        "#": gaussians.get_opacity.shape[0],
-                        "loss": ema_loss_for_log
-                        # Add more metrics as needed
-                    }
-                    # Send the data
-                    network_gui.send(net_image_bytes, dataset.source_path, metrics_dict)
-                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                        break
-                except Exception as e:
-                    # raise e
-                    network_gui.conn = None
-            
-
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -240,12 +218,36 @@ def training_report(tb_writer, iteration, Ll1, Ll1_feature, loss, l1_loss, elaps
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+
+                        # Apply PCA to reduce feature dimensions to 3 for RGB visualization using scikit-learn
+                        feature_map = render_pkg["feature_map"]  # (256, H, W)
+                        # Move to CPU and convert to numpy for sklearn
+                        feature_map_np = feature_map.permute(1, 2, 0).cpu().numpy()
+                        h, w, c = feature_map_np.shape
+                        feature_map_reshaped = feature_map_np.reshape(-1, c)
+                        
+                        # Apply PCA to get 3 components
+                        pca = PCA(n_components=3)
+                        pca_result = pca.fit_transform(feature_map_reshaped)
+                        
+                        # Normalize to [0, 1] for RGB visualization
+                        pca_min = pca_result.min(axis=0, keepdims=True)
+                        pca_max = pca_result.max(axis=0, keepdims=True)
+                        pca_normalized = (pca_result - pca_min) / (pca_max - pca_min + 1e-8)
+                        
+                        # Reshape back to image dimensions and convert back to torch tensor
+                        pca_rgb = pca_normalized.reshape(h, w, 3)
+                        pca_rgb_tensor = torch.from_numpy(pca_rgb).permute(2, 0, 1).float().to(feature_map.device)
+                        
+                        # Add both original feature map and PCA visualization to tensorboard
+                        tb_writer.add_images(config['name'] + "_view_{}/feature_map_pca".format(viewpoint.image_name), pca_rgb_tensor.unsqueeze(0), global_step=iteration)
+
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
@@ -266,17 +268,20 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+
+    default_iters = ",".join([str(it) for it in range(0, op.iterations, 1000)])
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(0, 30_000, 1000)))
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=list(range(0, 30_000, 1000)))
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=list(range(0, 30_000, 1000)))
+    parser.add_argument("--test_iterations", type=str, default=default_iters)
+    parser.add_argument("--save_iterations", type=str, default=default_iters)
+    parser.add_argument("--checkpoint_iterations", type=str, default=default_iters)
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--only_add_features", action="store_true", default=False)
+    parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+    args.save_iterations = {*list(map(int, args.save_iterations.split(","))), args.iterations}
     
     print("Optimizing " + args.model_path)
 
@@ -284,9 +289,19 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        testing_iterations=list(map(int, args.test_iterations.split(","))),
+        saving_iterations=args.save_iterations,
+        checkpoint_iterations=list(map(int, args.checkpoint_iterations.split(","))),
+        checkpoint=args.start_checkpoint,
+        debug_from=args.debug_from,
+        only_add_features=args.only_add_features,
+    )
 
     # All done
     print("\nTraining complete.")

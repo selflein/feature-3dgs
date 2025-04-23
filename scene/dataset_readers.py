@@ -197,7 +197,6 @@ def readColmapSceneInfo(path, foundation_model, images, eval, llffhold=8):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-            
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
